@@ -205,3 +205,14 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.log
+*.pdf
+*.zip
+*.jpg
+*.png
+instance/
