@@ -513,3 +513,6 @@ client = razorpay.Client(auth=(
     os.environ.get("RAZORPAY_KEY_ID"),
     os.environ.get("RAZORPAY_KEY_SECRET")
 ))
+git add requirements.txt
+git commit -m "Add setuptools dependency for Razorpay"
+git push origin main
