@@ -1,21 +1,537 @@
-MIT License
+from __future__ import annotations
+import os, io, json, shutil, tempfile, zipfile, re, uuid, time, threading
+from typing import List
+from flask import Flask, render_template_string, request, send_file, jsonify, after_this_request
+from werkzeug.utils import secure_filename
 
-Copyright (c) 2025 Akhil61623
+# PDF → Image (no Poppler)
+import fitz  # PyMuPDF
+from PIL import Image
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
+# Razorpay (optional)
+try:
+    import razorpay  # pip install razorpay
+except Exception:  # module not available is okay (payment disabled)
+    razorpay = None
 
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
+# ---------------- Config ----------------
+FREE_MAX_PAGES = 25
+FREE_MAX_MB = 25
+PAID_AMOUNT_INR = 10     # ₹10
+RAZORPAY_AMOUNT_PAISE = PAID_AMOUNT_INR * 100
 
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
+RAZORPAY_KEY_ID = os.environ.get("RAZORPAY_KEY_ID", "").strip()
+RAZORPAY_KEY_SECRET = os.environ.get("RAZORPAY_KEY_SECRET", "").strip()
+
+PAYMENT_ENABLED = bool(razorpay and RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET)
+
+TMP_ROOT = os.path.join(tempfile.gettempdir(), "akhi_pdf_jobs")
+os.makedirs(TMP_ROOT, exist_ok=True)
+
+app = Flask(__name__)
+
+# ---------------- Helpers ----------------
+def human_mb(nbytes: int) -> float:
+    return round(nbytes / 1024 / 1024, 2)
+
+def parse_range(range_text: str, total_pages: int) -> List[int]:
+    if not range_text:
+        return list(range(1, total_pages + 1))
+    pages = set()
+    tokens = re.split(r"\s*,\s*", range_text.strip())
+    for t in tokens:
+        if not t:
+            continue
+        if "-" in t:
+            a, b = t.split("-", 1)
+            if a.isdigit() and b.isdigit():
+                start, end = int(a), int(b)
+                if 1 <= start <= total_pages and start <= end:
+                    for p in range(start, min(end, total_pages) + 1):
+                        pages.add(p)
+        elif t.isdigit():
+            p = int(t)
+            if 1 <= p <= total_pages:
+                pages.add(p)
+    return sorted(pages) if pages else list(range(1, total_pages + 1))
+
+def job_dir(token: str) -> str:
+    return os.path.join(TMP_ROOT, token)
+
+def write_meta(tok: str, meta: dict):
+    with open(os.path.join(job_dir(tok), "meta.json"), "w", encoding="utf-8") as f:
+        json.dump(meta, f)
+
+def read_meta(tok: str) -> dict:
+    with open(os.path.join(job_dir(tok), "meta.json"), "r", encoding="utf-8") as f:
+        return json.load(f)
+
+def mark_paid(tok: str):
+    m = read_meta(tok)
+    m["paid"] = True
+    write_meta(tok, m)
+
+def cleanup_old_jobs(max_age_sec: int = 3600):
+    now = time.time()
+    for name in os.listdir(TMP_ROOT):
+        p = os.path.join(TMP_ROOT, name)
+        try:
+            if os.path.isdir(p):
+                st = os.stat(p)
+                if now - st.st_mtime > max_age_sec:
+                    shutil.rmtree(p, ignore_errors=True)
+        except Exception:
+            pass
+
+def background_cleaner():
+    while True:
+        cleanup_old_jobs()
+        time.sleep(600)
+
+threading.Thread(target=background_cleaner, daemon=True).start()
+
+# -------------- UI (HTML) --------------
+INDEX_HTML = r"""
+<!doctype html>
+<html lang="hi">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Mahamaya Stationery — PDF → Image Converter</title>
+<style>
+  :root{
+    --bg:#0b1220; --fg:#e7eaf1; --muted:#93a2bd; --card:#10182b;
+    --accent:#4f8cff; --accent2:#22c55e; --danger:#ef4444; --stroke:#203054;
+  }
+  *{box-sizing:border-box}
+  body{margin:0; font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial; background:var(--bg); color:var(--fg)}
+  .shell{min-height:100svh; display:grid; place-items:center; padding:24px}
+  .card{width:min(900px,100%); background:linear-gradient(180deg,#0f172a 0,#0b1220 100%);
+        border:1px solid var(--stroke); border-radius:20px; padding:24px; box-shadow:0 10px 40px rgba(0,0,0,.35)}
+  .top{display:flex; align-items:center; justify-content:space-between; gap:12px; flex-wrap:wrap}
+  .brand{display:flex; align-items:center; gap:10px; font-weight:800; letter-spacing:.2px}
+  .badge{font-size:12px; padding:2px 8px; border:1px solid var(--stroke); border-radius:999px; color:var(--muted)}
+  h1{margin:6px 0 8px; font-size:24px}
+  p.muted{color:var(--muted); margin:0 0 18px}
+  .grid{display:grid; grid-template-columns:1fr 1fr; gap:14px}
+  @media (max-width:720px){ .grid{grid-template-columns:1fr} }
+  label{font-size:13px; color:#cdd6ea; margin-bottom:6px; display:block}
+  select,input[type="text"]{
+    width:100%; background:#0d162a; color:var(--fg); border:1px solid var(--stroke);
+    border-radius:12px; padding:10px 12px; outline:none
+  }
+  .drop{border:2px dashed var(--stroke); border-radius:16px; padding:18px; background:#0e1830; text-align:center; transition:.2s}
+  .drop.drag{border-color:var(--accent); background:#112042}
+  .note{font-size:12px; color:var(--muted)}
+  .row{display:flex; gap:10px; align-items:center; flex-wrap:wrap}
+  button.btn{display:inline-flex; align-items:center; gap:8px; padding:10px 14px; border-radius:12px;
+    border:1px solid var(--stroke); background:var(--accent); color:#fff; font-weight:700; cursor:pointer}
+  button.ghost{background:#17233f}
+  button:disabled{opacity:.6; cursor:not-allowed}
+  .alert{margin-top:10px; padding:10px 12px; border-radius:12px; font-weight:600; display:none}
+  .alert.ok{background:rgba(34,197,94,.1); color:var(--accent2); border:1px solid rgba(34,197,94,.25)}
+  .alert.err{background:rgba(239,68,68,.1); color:var(--danger); border:1px solid rgba(239,68,68,.25)}
+  /* Fancy loader */
+  .loader{display:none; align-items:center; gap:8px}
+  .dot{width:8px; height:8px; border-radius:999px; background:#fff; opacity:.3; animation:bounce 1s infinite}
+  .dot:nth-child(2){animation-delay:.2s} .dot:nth-child(3){animation-delay:.4s}
+  @keyframes bounce{0%,80%,100%{transform:scale(.6);opacity:.3}40%{transform:scale(1);opacity:1}}
+  .paybox{display:none; margin-top:12px; padding:12px; border-radius:12px; border:1px solid var(--stroke); background:#0f1c36}
+</style>
+<script src="https://checkout.razorpay.com/v1/checkout.js"></script>
+</head>
+<body>
+<div class="shell">
+  <div class="card">
+    <div class="top">
+      <div class="brand">
+        <div style="width:30px;height:30px;border-radius:8px;background:linear-gradient(135deg,#4f8cff, #22c55e)"></div>
+        <div>Mahamaya Stationery</div>
+      </div>
+      <div class="badge">PDF → JPG/PNG</div>
+    </div>
+
+    <h1>तेज़ और साफ़ PDF → इमेज कन्वर्टर</h1>
+    <p class="muted">Free: 25 पेज या 25MB • उससे ऊपर: ₹10</p>
+
+    <div id="drop" class="drop" tabindex="0">
+      <strong>Drag & Drop</strong> <span class="note">या क्लिक कर के PDF चुनें</span>
+      <input id="file" type="file" accept="application/pdf" style="display:none" />
+      <div id="chosen" class="note" style="margin-top:8px"></div>
+    </div>
+
+    <div style="height:12px"></div>
+
+    <div class="grid">
+      <div>
+        <label for="dpi">क्वालिटी (DPI)</label>
+        <select id="dpi">
+          <option value="150">150</option>
+          <option value="200">200</option>
+          <option value="300">300</option>
+        </select>
+      </div>
+      <div>
+        <label for="format">फॉर्मेट</label>
+        <select id="format">
+          <option value="JPEG">JPG</option>
+          <option value="PNG">PNG</option>
+        </select>
+      </div>
+      <div style="grid-column:1/-1">
+        <label for="range">पेज रेंज (उदा. 1-3,5) — खाली छोड़ें = सभी</label>
+        <input id="range" type="text" placeholder="1-3,5" />
+      </div>
+    </div>
+
+    <div style="height:12px"></div>
+
+    <div class="row">
+      <button id="convertBtn" class="btn">Convert & Download</button>
+      <button id="chooseBtn" class="btn ghost">Choose PDF</button>
+      <div class="loader" id="loader"><div class="dot"></div><div class="dot"></div><div class="dot"></div><span class="note">कृपया प्रतीक्षा करें…</span></div>
+    </div>
+
+    <div id="paybox" class="paybox">
+      <div><strong>Limit पार हो गया</strong> — कृपया ₹10 पेमेंट करें आगे बढ़ने के लिए।</div>
+      <div style="margin-top:8px" class="row">
+        <button id="payBtn" class="btn">Pay ₹10</button>
+        <span id="payStatus" class="note"></span>
+      </div>
+    </div>
+
+    <div id="ok" class="alert ok">Done! Download starting…</div>
+    <div id="err" class="alert err">Error</div>
+
+    <p class="note" style="margin-top:10px">टिप: बड़े PDFs पर 150 DPI या पेज रेंज चुनना तेज़ रहता है।</p>
+  </div>
+</div>
+
+<script>
+const drop = document.getElementById('drop');
+const file = document.getElementById('file');
+const chooseBtn = document.getElementById('chooseBtn');
+const chosen = document.getElementById('chosen');
+const convertBtn = document.getElementById('convertBtn');
+const loader = document.getElementById('loader');
+const ok = document.getElementById('ok');
+const err = document.getElementById('err');
+const paybox = document.getElementById('paybox');
+const payBtn = document.getElementById('payBtn');
+const payStatus = document.getElementById('payStatus');
+
+let selected = null;
+let precheck = null; // {token, pages, size_mb, pay_required, order_id}
+
+function showOK(msg){ ok.textContent=msg; ok.style.display='block'; err.style.display='none'; }
+function showERR(msg){ err.textContent=msg; err.style.display='block'; ok.style.display='none'; }
+function clearAlerts(){ ok.style.display='none'; err.style.display='none'; payStatus.textContent=''; }
+
+drop.addEventListener('click', () => file.click());
+chooseBtn.addEventListener('click', () => file.click());
+
+['dragenter','dragover'].forEach(ev=>{
+  drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.add('drag'); });
+});
+['dragleave','drop'].forEach(ev=>{
+  drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.remove('drag'); });
+});
+drop.addEventListener('drop', e=>{
+  e.preventDefault();
+  if(e.dataTransfer.files?.length) setFile(e.dataTransfer.files[0]);
+});
+file.addEventListener('change', ()=>{
+  if (file.files.length) setFile(file.files[0]);
+});
+
+function setFile(f){
+  clearAlerts(); paybox.style.display='none';
+  if (f.type !== 'application/pdf') return showERR("कृपया PDF फ़ाइल चुनें।");
+  const mb = (f.size/1024/1024).toFixed(2);
+  selected = f;
+  chosen.textContent = `चुनी गई फ़ाइल: ${f.name} · ${mb} MB`;
+}
+
+convertBtn.addEventListener('click', async ()=>{
+  try{
+    clearAlerts();
+    if(!selected) return showERR("पहले PDF चुनें।");
+    loader.style.display='flex'; convertBtn.disabled = true; chooseBtn.disabled = true;
+
+    // 1) PRECHECK
+    const fd = new FormData();
+    fd.append('pdf_file', selected);
+    fd.append('dpi', document.getElementById('dpi').value);
+    fd.append('format', document.getElementById('format').value);
+    fd.append('range', document.getElementById('range').value);
+
+    const res = await fetch('/precheck', { method:'POST', body: fd });
+    const info = await res.json();
+    if(!res.ok){ throw new Error(info.error || ('HTTP ' + res.status)); }
+    precheck = info;
+
+    if(info.pay_required){
+      // show pay UI
+      paybox.style.display='block';
+      payStatus.textContent = "पेमेंट आवश्यक है।";
+      loader.style.display='none';
+      return;
+    } else {
+      // free — सीधे convert
+      await doConvert(info.token);
+    }
+  }catch(e){ showERR(e.message || 'Failed.'); }
+  finally{
+    loader.style.display='none'; convertBtn.disabled = false; chooseBtn.disabled = false;
+  }
+});
+
+payBtn.addEventListener('click', async ()=>{
+  try{
+    clearAlerts();
+    if(!precheck?.order_id){ return showERR("Order missing. दोबारा Try करें."); }
+    payStatus.textContent = "Checkout खोल रहा है…";
+
+    // key fetch
+    const keyRes = await fetch('/public-key');
+    const k = await keyRes.json();
+    if(!keyRes.ok || !k.key_id){ throw new Error("Payment unavailable"); }
+
+    const options = {
+      key: k.key_id,
+      amount: precheck.amount_paise,
+      currency: precheck.currency,
+      name: "Mahamaya Stationery",
+      description: "PDF→Image Conversion",
+      order_id: precheck.order_id,
+      handler: async function (response) {
+        // verify on server
+        const vfd = new FormData();
+        vfd.append('token', precheck.token);
+        vfd.append('razorpay_payment_id', response.razorpay_payment_id);
+        vfd.append('razorpay_order_id', response.razorpay_order_id);
+        vfd.append('razorpay_signature', response.razorpay_signature);
+
+        const vres = await fetch('/verify', { method:'POST', body: vfd });
+        const vjson = await vres.json();
+        if(!vres.ok || !vjson.ok) throw new Error(vjson.error || 'Verification failed');
+
+        // now convert
+        loader.style.display='flex';
+        await doConvert(precheck.token);
+      },
+      theme: { color: "#4f8cff" }
+    };
+    const rzp = new Razorpay(options);
+    rzp.open();
+  }catch(e){
+    showERR(e.message || 'Payment failed.');
+  }
+});
+
+async function doConvert(token){
+  const cfd = new FormData();
+  cfd.append('token', token);
+  cfd.append('dpi', document.getElementById('dpi').value);
+  cfd.append('format', document.getElementById('format').value);
+  cfd.append('range', document.getElementById('range').value);
+
+  const cres = await fetch('/convert', { method:'POST', body: cfd });
+  if(!cres.ok){
+    const t = await cres.text();
+    throw new Error(t || ('HTTP ' + cres.status));
+  }
+  const blob = await cres.blob();
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = 'converted_images.zip';
+  document.body.appendChild(a); a.click(); a.remove();
+  URL.revokeObjectURL(url);
+  showOK('हो गया! डाउनलोड शुरू हो गया।');
+  loader.style.display='none';
+  paybox.style.display='none';
+}
+</script>
+</body>
+</html>
+"""
+
+# -------------- Routes --------------
+@app.route("/")
+def home():
+    return render_template_string(INDEX_HTML)
+
+@app.route("/healthz")
+def health():
+    return "OK"
+
+@app.route("/public-key")
+def public_key():
+    # expose only key_id to client (safe)
+    if not PAYMENT_ENABLED:
+        return jsonify(error="Payment unavailable"), 503
+    return jsonify(key_id=RAZORPAY_KEY_ID)
+
+@app.route("/precheck", methods=["POST"])
+def precheck():
+    """
+    Receives the PDF once, stores temp, counts pages & size.
+    If over free limits and payment is enabled → create Razorpay order and return order_id.
+    Returns: {token, pages, size_mb, pay_required, order_id?, amount_paise?, currency?}
+    """
+    pdf = request.files.get("pdf_file")
+    if not pdf:
+        return jsonify(error="No file uploaded"), 400
+
+    # save temp job
+    tok = uuid.uuid4().hex
+    jdir = job_dir(tok)
+    os.makedirs(jdir, exist_ok=True)
+    fname = secure_filename(pdf.filename) or "input.pdf"
+    pdf_path = os.path.join(jdir, fname)
+    pdf.save(pdf_path)
+
+    # size
+    size_bytes = os.path.getsize(pdf_path)
+    size_mb = human_mb(size_bytes)
+
+    # count pages using PyMuPDF
+    try:
+        with fitz.open(pdf_path) as doc:
+            total = doc.page_count
+    except Exception as e:
+        shutil.rmtree(jdir, ignore_errors=True)
+        return jsonify(error=f"Invalid PDF: {e}"), 400
+
+    meta = {
+        "filename": fname,
+        "pdf_path": pdf_path,
+        "pages": total,
+        "size_mb": size_mb,
+        "paid": False,
+        "created": time.time(),
+    }
+    write_meta(tok, meta)
+
+    pay_required = (total > FREE_MAX_PAGES) or (size_mb > FREE_MAX_MB)
+
+    # If payment required but gateway not configured → block with 402-like
+    if pay_required and not PAYMENT_ENABLED:
+        return jsonify(
+            error="Paid conversion temporarily unavailable (contact admin).",
+            pages=total, size_mb=size_mb, pay_required=True
+        ), 503
+
+    resp = {
+        "ok": True,
+        "token": tok,
+        "pages": total,
+        "size_mb": size_mb,
+        "pay_required": bool(pay_required),
+    }
+
+    if pay_required and PAYMENT_ENABLED:
+        client = razorpay.Client(auth=(RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET))
+        order = client.order.create(dict(
+            amount=RAZORPAY_AMOUNT_PAISE,
+            currency="INR",
+            receipt=f"job_{tok}",
+            payment_capture=1
+        ))
+        # augment meta
+        meta["order_id"] = order.get("id")
+        write_meta(tok, meta)
+
+        resp["order_id"] = order.get("id")
+        resp["amount_paise"] = RAZORPAY_AMOUNT_PAISE
+        resp["currency"] = "INR"
+
+    return jsonify(resp)
+
+@app.route("/verify", methods=["POST"])
+def verify():
+    if not PAYMENT_ENABLED:
+        return jsonify(error="Payment disabled"), 503
+    tok = request.form.get("token", "")
+    if not tok or not os.path.isdir(job_dir(tok)):
+        return jsonify(error="Invalid token"), 400
+
+    order_id = request.form.get("razorpay_order_id")
+    payment_id = request.form.get("razorpay_payment_id")
+    signature = request.form.get("razorpay_signature")
+
+    try:
+        client = razorpay.Client(auth=(RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET))
+        client.utility.verify_payment_signature({
+            "razorpay_order_id": order_id,
+            "razorpay_payment_id": payment_id,
+            "razorpay_signature": signature
+        })
+    except Exception as e:
+        return jsonify(error=f"Verification failed: {e}"), 400
+
+    # Mark paid
+    mark_paid(tok)
+    return jsonify(ok=True)
+
+@app.route("/convert", methods=["POST"])
+def convert_route():
+    tok = request.form.get("token", "")
+    if not tok or not os.path.isdir(job_dir(tok)):
+        return ("Invalid or expired session. Re-upload your file.", 400)
+
+    meta = read_meta(tok)
+    pdf_path = meta["pdf_path"]
+    total = int(meta["pages"])
+    paid = bool(meta.get("paid"))
+
+    dpi = int(request.form.get("dpi", "150"))
+    fmt = request.form.get("format", "JPEG").upper()
+    rng = request.form.get("range", "").strip()
+    pages_to_keep = parse_range(rng, total)
+
+    # Enforce free limits
+    over = (total > FREE_MAX_PAGES) or (meta["size_mb"] > FREE_MAX_MB)
+    if over and not paid:
+        return ("Payment required. Please complete payment and try again.", 402)
+
+    tmp = tempfile.mkdtemp(prefix="pdf2img_")
+    try:
+        # Open and render pages
+        images = []
+        with fitz.open(pdf_path) as doc:
+            # Zoom factor from DPI (72 baseline)
+            zoom = dpi / 72.0
+            mat = fitz.Matrix(zoom, zoom)
+            for pno in pages_to_keep:
+                page = doc.load_page(pno - 1)
+                pix = page.get_pixmap(matrix=mat, alpha=False)
+                img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+                images.append(img)
+
+        # write images to zip
+        zip_path = os.path.join(tmp, "converted_images.zip")
+        with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            for i, img in enumerate(images, 1):
+                ext = "jpg" if fmt == "JPEG" else "png"
+                out_name = f"page_{i}.{ext}"
+                out_path = os.path.join(tmp, out_name)
+                img.save(out_path, fmt)
+                zf.write(out_path, out_name)
+
+        @after_this_request
+        def cleanup(response):
+            # remove both tmp and job dir
+            threading.Timer(2.0, shutil.rmtree, args=[tmp], kwargs={"ignore_errors": True}).start()
+            threading.Timer(10.0, shutil.rmtree, args=[job_dir(tok)], kwargs={"ignore_errors": True}).start()
+            return response
+
+        return send_file(zip_path, as_attachment=True, download_name="converted_images.zip")
+
+    except Exception as e:
+        threading.Timer(1.0, shutil.rmtree, args=[tmp], kwargs={"ignore_errors": True}).start()
+        return (f"Error: {e}", 500)
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 5000))
+    app.run(debug=False, host="0.0.0.0", port=port)
