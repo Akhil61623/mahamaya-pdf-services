@@ -1,218 +1,202 @@
-# Byte-compiled / optimized / DLL files
-__pycache__/
-*.py[codz]
-*$py.class
+from flask import Flask, render_template_string, request, send_file, after_this_request
+import os, io, zipfile, tempfile, shutil
+from threading import Timer
+from werkzeug.utils import secure_filename
 
-# C extensions
-*.so
+# PyMuPDF
+import fitz  # pymupdf
 
-# Distribution / packaging
-.Python
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-share/python-wheels/
-*.egg-info/
-.installed.cfg
-*.egg
-MANIFEST
+app = Flask(__name__)
 
-# PyInstaller
-#  Usually these files are written by a python script from a template
-#  before PyInstaller builds the exe, so as to inject date/other infos into it.
-*.manifest
-*.spec
+FREE_MAX_PAGES = 25
+FREE_MAX_MB = 25
 
-# Installer logs
-pip-log.txt
-pip-delete-this-directory.txt
+INDEX_HTML = r"""
+<!doctype html>
+<html lang="hi">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Mahamaya Stationery — PDF → Image Converter</title>
+<style>
+  :root{--bg:#0b1220;--fg:#e7eaf1;--muted:#93a2bd;--card:#10182b;--accent:#4f8cff;--ok:#22c55e;--err:#ef4444;}
+  *{box-sizing:border-box} body{margin:0;font-family:system-ui,Segoe UI,Roboto,Arial;background:var(--bg);color:var(--fg)}
+  .wrap{min-height:100svh;display:grid;place-items:center;padding:24px}
+  .card{width:min(880px,100%);background:linear-gradient(180deg,#0f172a 0,#0b1220 100%);border:1px solid #1f2a44;border-radius:18px;padding:22px;box-shadow:0 10px 40px rgba(0,0,0,.35)}
+  h1{margin:.2rem 0 .4rem} .muted{color:var(--muted)}
+  .row{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:.6rem 0}
+  input,select{background:#0e1629;border:1px solid #243356;color:var(--fg);border-radius:10px;padding:10px 12px;outline:none}
+  .btn{background:var(--accent);color:#fff;border:1px solid #2b3a60;border-radius:12px;padding:10px 14px;font-weight:700;cursor:pointer}
+  .note{font-size:12px;color:var(--muted)}
+  .alert{margin-top:10px;padding:10px 12px;border-radius:12px;display:none;font-weight:600}
+  .ok{background:rgba(34,197,94,.1);border:1px solid rgba(34,197,94,.25);color:var(--ok)}
+  .err{background:rgba(239,68,68,.1);border:1px solid rgba(239,68,68,.25);color:var(--err)}
+  .loader{display:none;align-items:center;gap:10px}
+  .spinner{width:18px;height:18px;border:3px solid rgba(255,255,255,.25);border-top-color:#fff;border-radius:50%;animation:spin 1s linear infinite}
+  @keyframes spin{to{transform:rotate(360deg)}}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="card">
+    <h1>Mahamaya Stationery — PDF → Image Converter</h1>
+    <p class="muted">Free up to <b>25 pages</b> or <b>25 MB</b>. उसके ऊपर फिलहाल conversion रोका जाएगा (पेमेंट इंटीग्रेशन अगला स्टेप है)।</p>
 
-# Unit test / coverage reports
-htmlcov/
-.tox/
-.nox/
-.coverage
-.coverage.*
-.cache
-nosetests.xml
-coverage.xml
-*.cover
-*.py.cover
-.hypothesis/
-.pytest_cache/
-cover/
+    <div class="row">
+      <input id="file" type="file" accept="application/pdf"/>
+      <label>DPI:
+        <select id="dpi">
+          <option value="150">150 (तेज़)</option>
+          <option value="200">200</option>
+          <option value="300">300 (शार्प)</option>
+        </select>
+      </label>
+      <label>Format:
+        <select id="fmt">
+          <option value="JPEG">JPG</option>
+          <option value="PNG">PNG</option>
+        </select>
+      </label>
+      <input id="range" type="text" placeholder="पेज रेंज: 1-3,5 (खाली = सभी)"/>
+      <button id="go" class="btn">Convert & Download ZIP</button>
+    </div>
 
-# Translations
-*.mo
-*.pot
+    <div class="loader" id="loader"><div class="spinner"></div><div class="note">Converting… कृपया इंतज़ार करें</div></div>
+    <div id="ok" class="alert ok"></div>
+    <div id="err" class="alert err"></div>
+    <p class="note">टिप: बड़े PDFs पर 150 DPI या पेज रेंज चुनना तेज़ रहता है।</p>
+  </div>
+</div>
+<script>
+const fileEl=document.getElementById('file');
+const go=document.getElementById('go');
+const ok=document.getElementById('ok');
+const err=document.getElementById('err');
+const loader=document.getElementById('loader');
 
-# Django stuff:
-*.log
-local_settings.py
-db.sqlite3
-db.sqlite3-journal
+function show(el,msg){ el.textContent=msg; el.style.display='block'; }
+function hide(el){ el.style.display='none'; }
 
-# Flask stuff:
-instance/
-.webassets-cache
+go.onclick=async()=>{
+  hide(ok); hide(err); loader.style.display='flex';
+  try{
+    if(!fileEl.files.length){ show(err,"कृपया PDF चुनें"); return; }
+    const fd=new FormData();
+    fd.append('pdf', fileEl.files[0]);
+    fd.append('dpi', document.getElementById('dpi').value);
+    fd.append('fmt', document.getElementById('fmt').value);
+    fd.append('range', document.getElementById('range').value);
 
-# Scrapy stuff:
-.scrapy
+    const res = await fetch('/convert', {method:'POST', body:fd});
+    if(res.status===402){
+      const msg = await res.text();
+      show(err, msg || "Limit crossed (payment required).");
+      return;
+    }
+    if(!res.ok){
+      const t=await res.text(); throw new Error(t || ("HTTP "+res.status));
+    }
+    const blob=await res.blob();
+    const url=URL.createObjectURL(blob);
+    const a=document.createElement('a');
+    a.href=url; a.download='converted_images.zip'; a.click();
+    URL.revokeObjectURL(url);
+    show(ok,"हो गया! Download शुरू हो गया।");
+  }catch(e){ show(err, e.message || "Conversion failed."); }
+  finally{ loader.style.display='none'; }
+};
+</script>
+</body>
+</html>
+"""
 
-# Sphinx documentation
-docs/_build/
+def parse_range(range_text: str, total_pages: int):
+    if not range_text:
+        return list(range(1, total_pages + 1))
+    pages=set()
+    import re
+    toks=re.split(r"\s*,\s*", range_text.strip())
+    for t in toks:
+        if not t: continue
+        if "-" in t:
+            a,b=t.split("-",1)
+            if a.isdigit() and b.isdigit():
+                s,e=int(a),int(b)
+                if 1<=s<=total_pages and s<=e:
+                    for p in range(s, min(e,total_pages)+1): pages.add(p)
+        elif t.isdigit():
+            p=int(t)
+            if 1<=p<=total_pages: pages.add(p)
+    return sorted(pages) if pages else list(range(1,total_pages+1))
 
-# PyBuilder
-.pybuilder/
-target/
+@app.route("/")
+def home():
+    return render_template_string(INDEX_HTML)
 
-# Jupyter Notebook
-.ipynb_checkpoints
+@app.route("/healthz")
+def health():
+    return "OK"
 
-# IPython
-profile_default/
-ipython_config.py
+@app.route("/convert", methods=["POST"])
+def convert_endpoint():
+    f = request.files.get("pdf")
+    if not f:
+        return ("No file", 400)
 
-# pyenv
-#   For a library or package, you might want to ignore these files since the code is
-#   intended to run in multiple environments; otherwise, check them in:
-# .python-version
+    # Size limit check (free)
+    try:
+        f.stream.seek(0, os.SEEK_END)
+        size = f.stream.tell()
+        f.stream.seek(0)
+    except Exception:
+        size = 0
+    if size and size > FREE_MAX_MB * 1024 * 1024:
+        return (f"File too large (Free limit {FREE_MAX_MB}MB).", 402)
 
-# pipenv
-#   According to pypa/pipenv#598, it is recommended to include Pipfile.lock in version control.
-#   However, in case of collaboration, if having platform-specific dependencies or dependencies
-#   having no cross-platform support, pipenv may install dependencies that don't work, or not
-#   install all needed dependencies.
-#Pipfile.lock
+    dpi = int(request.form.get("dpi","150"))
+    fmt = request.form.get("fmt","JPEG").upper()
+    rng = request.form.get("range","").strip()
 
-# UV
-#   Similar to Pipfile.lock, it is generally recommended to include uv.lock in version control.
-#   This is especially recommended for binary packages to ensure reproducibility, and is more
-#   commonly ignored for libraries.
-#uv.lock
+    tmp = tempfile.mkdtemp(prefix="pdf2img_")
+    try:
+        safe = secure_filename(f.filename) or "input.pdf"
+        pdf_path = os.path.join(tmp, safe)
+        f.save(pdf_path)
 
-# poetry
-#   Similar to Pipfile.lock, it is generally recommended to include poetry.lock in version control.
-#   This is especially recommended for binary packages to ensure reproducibility, and is more
-#   commonly ignored for libraries.
-#   https://python-poetry.org/docs/basic-usage/#commit-your-poetrylock-file-to-version-control
-#poetry.lock
-#poetry.toml
+        # Read PDF and count pages
+        doc = fitz.open(pdf_path)
+        total_pages = doc.page_count
+        if total_pages > FREE_MAX_PAGES:
+            doc.close()
+            return (f"Too many pages (Free limit {FREE_MAX_PAGES}).", 402)
 
-# pdm
-#   Similar to Pipfile.lock, it is generally recommended to include pdm.lock in version control.
-#   pdm recommends including project-wide configuration in pdm.toml, but excluding .pdm-python.
-#   https://pdm-project.org/en/latest/usage/project/#working-with-version-control
-#pdm.lock
-#pdm.toml
-.pdm-python
-.pdm-build/
+        pages = parse_range(rng, total_pages)
+        # Render pages to images
+        # dpi to zoom: 72 dpi base -> zoom = dpi/72
+        zoom = dpi / 72.0
+        mat = fitz.Matrix(zoom, zoom)
 
-# pixi
-#   Similar to Pipfile.lock, it is generally recommended to include pixi.lock in version control.
-#pixi.lock
-#   Pixi creates a virtual environment in the .pixi directory, just like venv module creates one
-#   in the .venv directory. It is recommended not to include this directory in version control.
-.pixi
+        memzip = io.BytesIO()
+        with zipfile.ZipFile(memzip, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            for idx, pno in enumerate(pages, 1):
+                page = doc.load_page(pno-1)
+                pix = page.get_pixmap(matrix=mat, alpha=False)
+                ext = "jpg" if fmt == "JPEG" else "png"
+                fname = f"page_{idx}.{ext}"
+                zf.writestr(fname, pix.tobytes(ext=ext))
+        doc.close()
+        memzip.seek(0)
 
-# PEP 582; used by e.g. github.com/David-OConnor/pyflow and github.com/pdm-project/pdm
-__pypackages__/
+        @after_this_request
+        def cleanup(resp):
+            Timer(3.0, shutil.rmtree, args=[tmp], kwargs={"ignore_errors": True}).start()
+            return resp
 
-# Celery stuff
-celerybeat-schedule
-celerybeat.pid
+        return send_file(memzip, as_attachment=True, download_name="converted_images.zip", mimetype="application/zip")
 
-# SageMath parsed files
-*.sage.py
+    except Exception as e:
+        Timer(1.0, shutil.rmtree, args=[tmp], kwargs={"ignore_errors": True}).start()
+        return (f"Error: {e}", 500)
 
-# Environments
-.env
-.envrc
-.venv
-env/
-venv/
-ENV/
-env.bak/
-venv.bak/
-
-# Spyder project settings
-.spyderproject
-.spyproject
-
-# Rope project settings
-.ropeproject
-
-# mkdocs documentation
-/site
-
-# mypy
-.mypy_cache/
-.dmypy.json
-dmypy.json
-
-# Pyre type checker
-.pyre/
-
-# pytype static type analyzer
-.pytype/
-
-# Cython debug symbols
-cython_debug/
-
-# PyCharm
-#  JetBrains specific template is maintained in a separate JetBrains.gitignore that can
-#  be found at https://github.com/github/gitignore/blob/main/Global/JetBrains.gitignore
-#  and can be added to the global gitignore or merged into this file.  For a more nuclear
-#  option (not recommended) you can uncomment the following to ignore the entire idea folder.
-#.idea/
-
-# Abstra
-# Abstra is an AI-powered process automation framework.
-# Ignore directories containing user credentials, local state, and settings.
-# Learn more at https://abstra.io/docs
-.abstra/
-
-# Visual Studio Code
-#  Visual Studio Code specific template is maintained in a separate VisualStudioCode.gitignore 
-#  that can be found at https://github.com/github/gitignore/blob/main/Global/VisualStudioCode.gitignore
-#  and can be added to the global gitignore or merged into this file. However, if you prefer, 
-#  you could uncomment the following to ignore the entire vscode folder
-# .vscode/
-
-# Ruff stuff:
-.ruff_cache/
-
-# PyPI configuration file
-.pypirc
-
-# Cursor
-#  Cursor is an AI-powered code editor. `.cursorignore` specifies files/directories to
-#  exclude from AI features like autocomplete and code analysis. Recommended for sensitive data
-#  refer to https://docs.cursor.com/context/ignore-files
-.cursorignore
-.cursorindexingignore
-
-# Marimo
-marimo/_static/
-marimo/_lsp/
-__marimo__/
-.venv/
-__pycache__/
-*.pyc
-*.pyo
-*.pyd
-*.log
-*.pdf
-*.zip
-*.jpg
-*.png
-instance/
+if __name__ == "__main__":
+    app.run(debug=False, host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
